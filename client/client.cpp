@@ -11,14 +11,38 @@
 using namespace std;
 namespace fs = std::filesystem;
 
+// Constants
 const int COORDINATOR_PORT = 9000;
+const DWORD SOCKET_TIMEOUT = 5000;
+const DWORD FILE_TRANSFER_TIMEOUT = 30000;
+
+// Utility functions
+unsigned long calculateChecksum(const char* data, int size) {
+    unsigned long sum = 0;
+    for (int i = 0; i < size; i++) {
+        sum += (unsigned char)data[i];
+    }
+    return sum;
+}
+
+void setSocketTimeouts(SOCKET sock, DWORD timeout) {
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+}
 
 SOCKET connectToCoordinator() {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     
     SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock == INVALID_SOCKET) return INVALID_SOCKET;
+    if (sock == INVALID_SOCKET) {
+        WSACleanup();
+        return INVALID_SOCKET;
+    }
+    
+    int opt = 1;
+    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (char*)&opt, sizeof(opt));
+    setSocketTimeouts(sock, SOCKET_TIMEOUT);
     
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -60,6 +84,8 @@ void uploadFile(const string& localPath, const string& dfsPath) {
         return;
     }
     
+    setSocketTimeouts(sock, FILE_TRANSFER_TIMEOUT);
+    
     string cmd = "UPLOAD " + dfsPath + "\n";
     send(sock, cmd.c_str(), cmd.size(), 0);
     
@@ -80,8 +106,6 @@ void uploadFile(const string& localPath, const string& dfsPath) {
     }
     
     delete[] fileData;
-    
-    cout << "Waiting for response...\n";
     
     char response[1024] = {0};
     int received = recv(sock, response, sizeof(response) - 1, 0);
@@ -113,15 +137,16 @@ void downloadFile(const string& dfsPath, const string& localPath) {
         return;
     }
     
+    setSocketTimeouts(sock, FILE_TRANSFER_TIMEOUT);
+    
     string cmd = "DOWNLOAD " + dfsPath + "\n";
     send(sock, cmd.c_str(), cmd.size(), 0);
     
-    // Read first line - could be recovery message or OK line
+    // Read response line by line
+    string firstLine;
     char lineBuffer[1024] = {0};
     int linePos = 0;
-    string firstLine = "";
     
-    // Read first line
     while (linePos < sizeof(lineBuffer) - 1) {
         int received = recv(sock, lineBuffer + linePos, 1, 0);
         if (received <= 0) {
@@ -138,10 +163,10 @@ void downloadFile(const string& dfsPath, const string& localPath) {
         linePos++;
     }
     
-    // Check if first line is recovery message
+    // Check for recovery message
     if (firstLine.find("failed") != string::npos || firstLine.find("recovered") != string::npos) {
         cout << firstLine << "\n";
-        // Read next line which should be OK line
+        // Read next line
         linePos = 0;
         memset(lineBuffer, 0, sizeof(lineBuffer));
         while (linePos < sizeof(lineBuffer) - 1) {
@@ -168,7 +193,7 @@ void downloadFile(const string& dfsPath, const string& localPath) {
         return;
     }
     
-    // Parse OK line: "OK <size> <checksum>"
+    // Parse OK line
     stringstream ss(firstLine);
     string ok, sizeStr, checksumStr;
     ss >> ok >> sizeStr >> checksumStr;
@@ -183,8 +208,7 @@ void downloadFile(const string& dfsPath, const string& localPath) {
     int fileSize = atoi(sizeStr.c_str());
     unsigned long expectedChecksum = strtoul(checksumStr.c_str(), NULL, 10);
     
-    cout << "Receiving file (" << fileSize << " bytes)...\n";
-    
+    // Receive file data
     char* fileData = new char[fileSize];
     int fileReceived = 0;
     
@@ -200,23 +224,18 @@ void downloadFile(const string& dfsPath, const string& localPath) {
         fileReceived += received;
     }
     
-    cout << "Received " << fileReceived << " bytes\n";
-    
     closesocket(sock);
     WSACleanup();
     
-    unsigned long calculatedChecksum = 0;
-    for (int i = 0; i < fileSize; i++) {
-        calculatedChecksum += (unsigned char)fileData[i];
-    }
-    
+    // Verify checksum
+    unsigned long calculatedChecksum = calculateChecksum(fileData, fileSize);
     if (calculatedChecksum != expectedChecksum) {
         cerr << "Checksum mismatch\n";
         delete[] fileData;
         return;
     }
     
-    // Create parent directory if needed
+    // Save file
     fs::path localFilePath(localPath);
     fs::path parentDir = localFilePath.parent_path();
     if (!parentDir.empty() && parentDir != "." && parentDir != localFilePath.root_path()) {

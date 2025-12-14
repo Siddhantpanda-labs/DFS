@@ -6,19 +6,22 @@
 #include <sstream>
 #include <windows.h>
 #include <filesystem>
-#include <direct.h>
 
 #pragma comment(lib, "ws2_32.lib")
 
 using namespace std;
 namespace fs = std::filesystem;
 
+// Constants
 const int COORDINATOR_PORT = 9000;
 const int NODE_BASE_PORT = 9001;
+const DWORD SOCKET_TIMEOUT = 30000;  // 30 seconds for file transfers
 
+// Global state
 string storageFolder;
 int nodeId;
 
+// Utility functions
 unsigned long calculateChecksum(const char* data, int size) {
     unsigned long sum = 0;
     for (int i = 0; i < size; i++) {
@@ -27,15 +30,32 @@ unsigned long calculateChecksum(const char* data, int size) {
     return sum;
 }
 
-// Forward declarations
-void handleDelete(SOCKET clientSock, const string& dfsPath);
+string cleanPath(const string& dfsPath) {
+    string clean = dfsPath;
+    if (!clean.empty() && clean[0] == '/') {
+        clean = clean.substr(1);
+    }
+    for (size_t i = 0; i < clean.length(); i++) {
+        if (clean[i] == '/') {
+            clean[i] = '\\';
+        }
+    }
+    return clean;
+}
+
+fs::path getFilePath(const string& dfsPath) {
+    return fs::path(storageFolder) / cleanPath(dfsPath);
+}
 
 bool registerWithCoordinator() {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     
     SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock == INVALID_SOCKET) return false;
+    if (sock == INVALID_SOCKET) {
+        WSACleanup();
+        return false;
+    }
     
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -61,16 +81,28 @@ bool registerWithCoordinator() {
     return string(response).find("REGISTERED") != string::npos;
 }
 
-void handleStore(SOCKET clientSock, const string& dfsPath, int fileSize, unsigned long expectedChecksum) {
-    cout << "[NODE " << nodeId << "] STORE: " << dfsPath << " (" << fileSize << " bytes)\n";
+// Command handlers
+void handleStore(SOCKET clientSock, const string& dfsPath, int fileSize, unsigned long expectedChecksum, const string& remainingData) {
+    // Set timeout for receiving file data
+    DWORD timeout = SOCKET_TIMEOUT;
+    setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
     
+    // Receive file data
     char* fileData = new char[fileSize];
     int totalReceived = 0;
     
+    // Copy any data already in buffer
+    if (!remainingData.empty()) {
+        int toCopy = min((int)remainingData.length(), fileSize);
+        memcpy(fileData, remainingData.c_str(), toCopy);
+        totalReceived = toCopy;
+    }
+    
+    // Receive remaining data
     while (totalReceived < fileSize) {
         int received = recv(clientSock, fileData + totalReceived, fileSize - totalReceived, 0);
         if (received <= 0) {
-            cerr << "[NODE " << nodeId << "] Failed to receive file data\n";
+            cerr << "[NODE " << nodeId << "] Failed to receive file data (received " << totalReceived << " of " << fileSize << " bytes)\n";
             delete[] fileData;
             send(clientSock, "ERROR\n", 6, 0);
             return;
@@ -78,51 +110,30 @@ void handleStore(SOCKET clientSock, const string& dfsPath, int fileSize, unsigne
         totalReceived += received;
     }
     
-    cout << "[NODE " << nodeId << "] Received " << totalReceived << " bytes\n";
-    
+    // Verify checksum
     unsigned long calculatedChecksum = calculateChecksum(fileData, fileSize);
-    cout << "[NODE " << nodeId << "] Checksum: " << calculatedChecksum << " (expected: " << expectedChecksum << ")\n";
-    
     if (calculatedChecksum != expectedChecksum) {
-        cerr << "[NODE " << nodeId << "] Checksum mismatch!\n";
+        cerr << "[NODE " << nodeId << "] Checksum mismatch\n";
         delete[] fileData;
         send(clientSock, "ERROR\n", 6, 0);
         return;
     }
     
-    // Strip leading slash from dfsPath if present (Windows treats / as absolute)
-    string cleanPath = dfsPath;
-    if (!cleanPath.empty() && cleanPath[0] == '/') {
-        cleanPath = cleanPath.substr(1);  // Remove leading /
-    }
-    
-    // Replace forward slashes with backslashes for Windows
-    for (size_t i = 0; i < cleanPath.length(); i++) {
-        if (cleanPath[i] == '/') {
-            cleanPath[i] = '\\';
-        }
-    }
-    
-    // Create full path using storage folder + cleaned path
-    fs::path filePath = fs::path(storageFolder) / cleanPath;
-    fs::path absPath = fs::absolute(filePath);
-    
-    cout << "[NODE " << nodeId << "] Storage folder: " << storageFolder << "\n";
-    cout << "[NODE " << nodeId << "] Cleaned path: " << cleanPath << "\n";
-    cout << "[NODE " << nodeId << "] Full path: " << absPath << "\n";
-    
-    // Create parent directories if needed
+    // Save file
+    fs::path filePath = getFilePath(dfsPath);
     fs::path parentDir = filePath.parent_path();
+    
     if (!parentDir.empty() && parentDir != "." && parentDir != filePath.root_path()) {
-        cout << "[NODE " << nodeId << "] Creating directories: " << parentDir << "\n";
         try {
             fs::create_directories(parentDir);
         } catch (const exception& e) {
             cerr << "[NODE " << nodeId << "] Failed to create directories: " << e.what() << "\n";
+            delete[] fileData;
+            send(clientSock, "ERROR\n", 6, 0);
+            return;
         }
     }
     
-    cout << "[NODE " << nodeId << "] Opening file for writing...\n";
     ofstream outFile(filePath, ios::binary);
     if (!outFile.is_open()) {
         cerr << "[NODE " << nodeId << "] Cannot create file: " << filePath << "\n";
@@ -131,58 +142,36 @@ void handleStore(SOCKET clientSock, const string& dfsPath, int fileSize, unsigne
         return;
     }
     
-    cout << "[NODE " << nodeId << "] Writing " << fileSize << " bytes...\n";
     outFile.write(fileData, fileSize);
     outFile.close();
     delete[] fileData;
     
-    // Verify file was created and show absolute path
     if (fs::exists(filePath)) {
-        auto file_size = fs::file_size(filePath);
-        cout << "[NODE " << nodeId << "] SUCCESS: File saved at " << filePath << " (" << file_size << " bytes)\n";
-        cout << "[NODE " << nodeId << "] Absolute path: " << fs::absolute(filePath) << "\n";
+        cout << "[NODE " << nodeId << "] STORE: " << dfsPath << " (" << fileSize << " bytes)\n";
+        send(clientSock, "OK\n", 3, 0);
     } else {
-        cerr << "[NODE " << nodeId << "] ERROR: File was not created at " << filePath << "\n";
-        cerr << "[NODE " << nodeId << "] Current directory: " << fs::current_path() << "\n";
+        cerr << "[NODE " << nodeId << "] ERROR: File was not created\n";
+        send(clientSock, "ERROR\n", 6, 0);
     }
-    
-    send(clientSock, "OK\n", 3, 0);
 }
 
 void handleGet(SOCKET clientSock, const string& dfsPath) {
-    cout << "[NODE " << nodeId << "] GET request for: " << dfsPath << "\n";
-    
-    // Strip leading slash and convert to Windows path (same as STORE)
-    string cleanPath = dfsPath;
-    if (!cleanPath.empty() && cleanPath[0] == '/') {
-        cleanPath = cleanPath.substr(1);
-    }
-    for (size_t i = 0; i < cleanPath.length(); i++) {
-        if (cleanPath[i] == '/') {
-            cleanPath[i] = '\\';
-        }
-    }
-    
-    fs::path filePath = fs::path(storageFolder) / cleanPath;
-    fs::path absPath = fs::absolute(filePath);
-    
-    cout << "[NODE " << nodeId << "] Looking for file at: " << absPath << "\n";
+    fs::path filePath = getFilePath(dfsPath);
     
     if (!fs::exists(filePath)) {
-        cerr << "[NODE " << nodeId << "] File not found: " << absPath << "\n";
+        cerr << "[NODE " << nodeId << "] File not found: " << dfsPath << "\n";
         send(clientSock, "ERROR\n", 6, 0);
         return;
     }
     
     ifstream inFile(filePath, ios::binary | ios::ate);
     if (!inFile.is_open()) {
-        cerr << "[NODE " << nodeId << "] Cannot open file: " << absPath << "\n";
+        cerr << "[NODE " << nodeId << "] Cannot open file: " << dfsPath << "\n";
         send(clientSock, "ERROR\n", 6, 0);
         return;
     }
     
     int fileSize = (int)inFile.tellg();
-    cout << "[NODE " << nodeId << "] File size: " << fileSize << " bytes\n";
     inFile.seekg(0, ios::beg);
     
     char* fileData = new char[fileSize];
@@ -190,15 +179,14 @@ void handleGet(SOCKET clientSock, const string& dfsPath) {
     inFile.close();
     
     unsigned long checksum = calculateChecksum(fileData, fileSize);
-    cout << "[NODE " << nodeId << "] Checksum: " << checksum << "\n";
     
+    // Send size, checksum, then data
     string sizeStr = to_string(fileSize) + "\n";
     send(clientSock, sizeStr.c_str(), sizeStr.size(), 0);
     
     string checksumStr = to_string(checksum) + "\n";
     send(clientSock, checksumStr.c_str(), checksumStr.size(), 0);
     
-    cout << "[NODE " << nodeId << "] Sending " << fileSize << " bytes...\n";
     int totalSent = 0;
     while (totalSent < fileSize) {
         int sent = send(clientSock, fileData + totalSent, fileSize - totalSent, 0);
@@ -210,35 +198,23 @@ void handleGet(SOCKET clientSock, const string& dfsPath) {
     }
     
     delete[] fileData;
-    cout << "[NODE " << nodeId << "] Sent: " << dfsPath << " (" << fileSize << " bytes)\n";
+    cout << "[NODE " << nodeId << "] GET: " << dfsPath << " (" << fileSize << " bytes)\n";
 }
 
 void handleDelete(SOCKET clientSock, const string& dfsPath) {
-    // Strip leading slash and convert to Windows path
-    string cleanPath = dfsPath;
-    if (!cleanPath.empty() && cleanPath[0] == '/') {
-        cleanPath = cleanPath.substr(1);
-    }
-    for (size_t i = 0; i < cleanPath.length(); i++) {
-        if (cleanPath[i] == '/') {
-            cleanPath[i] = '\\';
-        }
-    }
-    
-    fs::path filePath = fs::path(storageFolder) / cleanPath;
+    fs::path filePath = getFilePath(dfsPath);
     
     if (fs::exists(filePath)) {
         try {
             fs::remove(filePath);
-            cout << "[NODE " << nodeId << "] Deleted: " << filePath << "\n";
+            cout << "[NODE " << nodeId << "] DELETE: " << dfsPath << "\n";
             send(clientSock, "OK\n", 3, 0);
         } catch (const exception& e) {
             cerr << "[NODE " << nodeId << "] Failed to delete: " << e.what() << "\n";
             send(clientSock, "ERROR\n", 6, 0);
         }
     } else {
-        cout << "[NODE " << nodeId << "] File not found: " << filePath << "\n";
-        send(clientSock, "OK\n", 3, 0);  // Already deleted or doesn't exist
+        send(clientSock, "OK\n", 3, 0);
     }
 }
 
@@ -254,26 +230,22 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    // Use relative path from where executable is run
     storageFolder = "storage\\node" + to_string(nodeId);
     fs::create_directories(storageFolder);
     
-    // Convert to absolute path for display
-    fs::path absPath = fs::absolute(storageFolder);
-    cout << "Node " << nodeId << " storage folder: " << absPath << "\n";
-    
-    cout << "Registering with coordinator...\n";
     if (!registerWithCoordinator()) {
         cerr << "Failed to register\n";
         return 1;
     }
     
-    cout << "Node " << nodeId << " registered successfully\n";
+    cout << "Node " << nodeId << " registered\n";
     
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
     
     SOCKET server = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
     
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -283,11 +255,14 @@ int main(int argc, char* argv[]) {
     bind(server, (sockaddr*)&addr, sizeof(addr));
     listen(server, 5);
     
-    cout << "Node " << nodeId << " listening on port " << (NODE_BASE_PORT + nodeId) << "\n";
-    
     while (true) {
         SOCKET client = accept(server, NULL, NULL);
         if (client == INVALID_SOCKET) continue;
+        
+        // Set default timeout for command reading
+        DWORD timeout = SOCKET_TIMEOUT;
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, (char*)&timeout, sizeof(timeout));
         
         char buffer[1024] = {0};
         int received = recv(client, buffer, sizeof(buffer) - 1, 0);
@@ -297,8 +272,15 @@ int main(int argc, char* argv[]) {
         }
         
         buffer[received] = '\0';
-        string cmd(buffer);
-        stringstream ss(cmd);
+        string cmdLine(buffer);
+        size_t newlinePos = cmdLine.find('\n');
+        
+        if (newlinePos == string::npos) {
+            closesocket(client);
+            continue;
+        }
+        
+        stringstream ss(cmdLine.substr(0, newlinePos));
         string command;
         ss >> command;
         
@@ -307,7 +289,14 @@ int main(int argc, char* argv[]) {
             int fileSize;
             unsigned long checksum;
             ss >> dfsPath >> fileSize >> checksum;
-            handleStore(client, dfsPath, fileSize, checksum);
+            
+            // Extract any file data already in buffer (after the command line)
+            string remainingData;
+            if (received > (int)(newlinePos + 1)) {
+                remainingData = string(buffer + newlinePos + 1, received - (newlinePos + 1));
+            }
+            
+            handleStore(client, dfsPath, fileSize, checksum, remainingData);
         }
         else if (command == "GET") {
             string dfsPath;

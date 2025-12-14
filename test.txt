@@ -1,4 +1,3 @@
-“ଉଠ୍ ରେ! ନିଜ୍ ଭିତରର୍ ଆଗ୍ ଜଳା,
-ଦୁର୍ବଳତାକେ ଜଳେଇ ଖାକ୍ କର୍।
-ଅର୍ଜୁନ, ଧର୍ତି ଉପରେ ରାଜ୍ କର୍—
-ତୁଇଁ ହିଁ ନିଜ୍ ଭାଗ୍ୟର୍ ରାଜା।”
+This repository contains a demonstration implementation of core concepts and workflows. It is intended for learning,
+experimentation, and structured practice, with a focus on clean code, version control, and modular design.
+The project serves as a foundation for exploring algorithms, improving problem-solving skills, and maintaining professional development standards.
